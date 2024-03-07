@@ -37,7 +37,7 @@ carried out or RL agents that optimize only one or two parameters.
 
 Note: that ns-3 installtion directory is called Path_to_NS3_Directory.
 
-1- Copy New_agent folder to Path_to_NS3_Directory/scratch/. Try not to use nested folders i.e. avoid: scratch/folder1/folder2/file.cc, instead use scratch/folder1/file.cc. 
+1- Copy New_agent,TD3 folders to Path_to_NS3_Directory/scratch/. Try not to use nested folders i.e. avoid: scratch/folder1/folder2/file.cc, instead use scratch/folder1/file.cc. 
 
 2- Replace the diectory Path_to_NS3_Directory/scr/lte with the directory inside the archived file in lte(1).zip (Rememebr to backup the original)
 
@@ -81,3 +81,4 @@ $ chmod +x ./New_agent.sh
 ```
 $ ./waf --run "scratch/New_agent/New_agent --RunNum=$(($i))"
 ```
+-Same applies for the TD3 agent by changing New_agent to TD3 when using aformentioned commands
