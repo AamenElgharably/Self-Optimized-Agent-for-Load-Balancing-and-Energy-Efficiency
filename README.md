@@ -1,4 +1,17 @@
 # Self-Optimized-Agent-for-Load-Balancing-and-Energy-Efficiency
+ We consider the problem of optimization of mobile networks. We aim to enhance the
+network throughput, minimize energy consumption, and improve network coverage. The problem is cast
+as a reinforcement learning (RL) problem. The reward function accounts for the joint optimization of
+throughput, energy consumption, and coverage; our formulation allows the network operator to assign
+weights to each of these cost functions based on the operator’s preferences. Moreover, the state is defined
+by key performance indicators (KPIs) that are readily available on the network operator side. Finally, the
+action space for the RL agent comprises a hybrid action space, where we have two continuous action
+elements, namely, cell individual offsets (CIOs) and transmission powers, and one discrete action element,
+which is switching MIMO ON and OFF. To that end, we propose a new layered RL agent structure to
+account for the agent hybrid space. We test our proposed RL agent over two scenarios: a simple (proof
+of concept) scenario and a realistic network scenario. Our results show significant performance gains of
+our proposed RL agent compared to some baseline approaches, e.g., a system where no optimization is
+carried out or RL agents that optimize only one or two parameters.
 # Installation
 ## Installing Prerequisites
 
