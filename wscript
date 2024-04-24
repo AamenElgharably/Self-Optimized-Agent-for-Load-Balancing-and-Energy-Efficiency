@@ -1,343 +1,744 @@
+
 ## -*- Mode: python; py-indent-offset: 4; indent-tabs-mode: nil; coding: utf-8; -*-
+from __future__ import print_function
+import os, os.path
+import sys
+import shutil
+import types
+import warnings
+
+from waflib import TaskGen, Task, Options, Build, Utils
+from waflib.Errors import WafError
+import wutils
+
+try:
+    set
+except NameError:
+    from sets import Set as set # Python 2.3 fallback
+
+
+
+all_modules = []
+for dirname in os.listdir('src'):
+    if dirname.startswith('.') or dirname == 'CVS':
+        continue
+    path = os.path.join('src', dirname)
+    if not os.path.isdir(path):
+        continue
+    if os.path.exists(os.path.join(path, 'wscript')):
+        all_modules.append(dirname)
+all_modules.sort()
+
+def get_required_boost_libs(conf):
+    for module in all_modules:
+        conf.recurse (module, name="required_boost_libs", mandatory=False)
+
+def options(opt):
+    opt.add_option('--enable-rpath',
+                   help=("Link programs with rpath"
+                         " (normally not needed, see "
+                         " --run and --shell; moreover, only works in some"
+                         " specific platforms, such as Linux and Solaris)"),
+                   action="store_true", dest='enable_rpath', default=False)
+    
+    opt.add_option('--enable-modules',
+                   help=("Build only these modules (and dependencies)"),
+                   dest='enable_modules')
+
+    opt.load('boost', tooldir=['waf-tools'])
+
+    for module in all_modules:
+        opt.recurse(module, mandatory=False)
+
+def configure(conf):
+    # Append blddir to the module path before recursing into modules
+    blddir = os.path.abspath(os.path.join(conf.bldnode.abspath(), conf.variant))
+    conf.env.append_value('NS3_MODULE_PATH', blddir + "/lib")
+
+    for module in all_modules:
+        conf.recurse(module, mandatory=False)
+
+    # Remove duplicate path items
+    conf.env['NS3_MODULE_PATH'] = wutils.uniquify_list(conf.env['NS3_MODULE_PATH'])
+
+    if Options.options.enable_rpath:
+        conf.env.append_value('RPATH', '-Wl,-rpath,%s' % (os.path.join(blddir),))
+
+    ## Used to link the 'test-runner' program with all of ns-3 code
+    conf.env['NS3_MODULES'] = ['ns3-' + module.split('/')[-1] for module in all_modules]
+
+
+
+# we need the 'ns3module' waf "feature" to be created because code
+# elsewhere looks for it to find the ns3 module objects.
+@TaskGen.feature('ns3module')
+def _add_test_code(module):
+    pass
+
+def create_ns3_module(bld, name, dependencies=(), test=False):
+    static = bool(bld.env.ENABLE_STATIC_NS3)
+    # Create a separate library for this module.
+    if static:
+        module = bld(features='cxx cxxstlib ns3module')
+    else:
+        module = bld(features='cxx cxxshlib ns3module')
+    module.target = '%s/lib/ns%s-%s%s' % (bld.srcnode.path_from(module.path), wutils.VERSION,
+                                       name, bld.env.BUILD_SUFFIX)
+    linkflags = []
+    cxxflags = []
+    ccflags = []
+    if not static:
+        cxxflags = module.env['shlib_CXXFLAGS']
+        ccflags = module.env['shlib_CXXFLAGS']
+        # Turn on the link flags for shared libraries if we have the
+        # proper compiler and platform.
+        if module.env['CXX_NAME'] in ['gcc', 'icc'] and module.env['WL_SONAME_SUPPORTED']:
+            # Get the module library name without any relative paths
+            # at its beginning because all of the libraries will end
+            # up in the same directory.
+            module_library_name = module.env.cshlib_PATTERN % (os.path.basename(module.target),)
+            linkflags = '-Wl,--soname=' + module_library_name
+    cxxdefines = ["NS3_MODULE_COMPILATION"]
+    ccdefines = ["NS3_MODULE_COMPILATION"]
+
+    module.env.append_value('CXXFLAGS', cxxflags)
+    module.env.append_value('CCFLAGS', ccflags)
+    module.env.append_value('LINKFLAGS', linkflags)
+    module.env.append_value('CXXDEFINES', cxxdefines)
+    module.env.append_value('CCDEFINES', ccdefines)
+
+    module.is_static = static
+    module.vnum = wutils.VNUM
+    # Add the proper path to the module's name.
+    # Set the libraries this module depends on.  
+    module.module_deps = list(dependencies)
+
+    module.install_path = "${LIBDIR}"
+
+    module.name = "ns3-" + name
+    module.dependencies = dependencies
+    # Initially create an empty value for this because the pcfile
+    # writing task assumes every module has a uselib attribute.
+    module.uselib = ''
+    module.use = ['ns3-' + dep for dep in dependencies]
+    module.test = test
+    module.is_ns3_module = True
+    module.ns3_dir_location = bld.path.path_from(bld.srcnode)
+
+    module.env.append_value("INCLUDES", '#')
+
+    module.pcfilegen = bld(features='ns3pcfile')
+    module.pcfilegen.module = module.name
+    
+    return module
+
+@TaskGen.feature("ns3testlib")
+@TaskGen.before_method("apply_incpaths")
+def apply_incpaths_ns3testlib(self):
+    if not self.source:
+        return
+    testdir = self.to_nodes(self.source[-1])[0].parent.path_from(self.bld.srcnode)
+    self.env.append_value("DEFINES", 'NS_TEST_SOURCEDIR="%s"' % (testdir,))
+
+
+def create_ns3_module_test_library(bld, name):
+    # Create an ns3 module for the test library that depends only on
+    # the module being tested.
+    library_name = name + "-test"
+    library = bld.create_ns3_module(library_name, [name], test=True)
+    library.features += " ns3testlib"
+
+    # Modify attributes for the test library that are different from a
+    # normal module.
+    del library.is_ns3_module
+    library.is_ns3_module_test_library = True
+    library.module_name = 'ns3-' + name
+
+    # Add this module and test library to the list.
+    bld.env.append_value('NS3_MODULES_WITH_TEST_LIBRARIES', [(library.module_name, library.name)])
+
+    # Set the include path from the build directory to modules. 
+    relative_path_from_build_to_here = bld.path.path_from(bld.bldnode)
+    include_flag = '-I' + relative_path_from_build_to_here
+    library.env.append_value('CXXFLAGS', include_flag)
+    library.env.append_value('CCFLAGS',  include_flag)
+
+    return library
+
+def create_obj(bld, *args):
+    warnings.warn("(in %s) Use bld(...) call now, instead of bld.create_obj(...)" % str(bld.path),
+                  DeprecationWarning, stacklevel=2)
+    return bld(*args)
+
+
+def ns3_python_bindings(bld):
+
+    # this method is called from a module wscript, so remember bld.path is not bindings/python!
+    module_abs_src_path = bld.path.abspath()
+    module = os.path.basename(module_abs_src_path)
+    env = bld.env
+    env.append_value("MODULAR_BINDINGS_MODULES", "ns3-"+module)
+
+    if Options.options.apiscan:
+        return
+
+    if not env['ENABLE_PYTHON_BINDINGS']:
+        return
+
+    bindings_dir = bld.path.find_dir("bindings")
+    if bindings_dir is None or not os.path.exists(bindings_dir.abspath()):
+        warnings.warn("(in %s) Requested to build modular python bindings, but apidefs dir not found "
+                      "=> skipped the bindings." % str(bld.path),
+                      Warning, stacklevel=2)
+        return
+
+    if ("ns3-%s" % (module,)) not in env.NS3_ENABLED_MODULES:
+        #print "bindings for module %s which is not enabled, skip" % module
+        return
+
+    env.append_value('PYTHON_MODULES_BUILT', module)
+    try:
+        apidefs = env['PYTHON_BINDINGS_APIDEFS'].replace("-", "_")
+    except AttributeError:
+        # we likely got an empty list for env['PYTHON_BINDINGS_APIDEFS']
+        return
+
+    #debug = ('PYBINDGEN_DEBUG' in os.environ)
+    debug = True # XXX
+    source = [bld.srcnode.find_resource('bindings/python/ns3modulegen-modular.py'),
+              bld.path.find_resource("bindings/modulegen__%s.py" % apidefs)]
+
+    modulegen_customizations = bindings_dir.find_resource("modulegen_customizations.py")
+    if modulegen_customizations is not None:
+        source.append(modulegen_customizations)
+
+    modulegen_local = bld.path.find_resource("bindings/modulegen_local.py")
+    # the local customization file may or not exist
+    if modulegen_local is not None:
+        source.append("bindings/modulegen_local.py")
+
+    module_py_name = module.replace('-', '_')
+    module_target_dir = bld.srcnode.find_dir("bindings/python/ns").path_from(bld.path)
+
+    # if bindings/<module>.py exists, it becomes the module frontend, and the C extension befomes _<module>
+    if bld.path.find_resource("bindings/%s.py" % (module_py_name,)) is not None:
+        bld(features='copy',
+            source=("bindings/%s.py" % (module_py_name,)),
+            target=('%s/%s.py' % (module_target_dir, module_py_name)))
+        extension_name = '_%s' % (module_py_name,)
+        bld.install_files('${PYTHONARCHDIR}/ns', ["bindings/%s.py" % (module_py_name,)])
+    else:
+        extension_name = module_py_name
+
+    target = ['bindings/ns3module.cc', 'bindings/ns3module.h', 'bindings/ns3modulegen.log']
+    #if not debug:
+    #    target.append('ns3modulegen.log')
+
+    argv = ['NS3_ENABLED_FEATURES=${FEATURES}',
+            'GCC_RTTI_ABI_COMPLETE=${GCC_RTTI_ABI_COMPLETE}',
+            '${PYTHON}']
+    #if debug:
+    #    argv.extend(["-m", "pdb"])
+    
+    argv.extend(['${SRC[0]}', module_abs_src_path, apidefs, extension_name, '${TGT[0]}'])
+
+    argv.extend(['2>', '${TGT[2]}']) # 2> ns3modulegen.log
+
+    features = []
+    for (name, caption, was_enabled, reason_not_enabled) in env['NS3_OPTIONAL_FEATURES']:
+        if was_enabled:
+            features.append(name)
+
+    bindgen = bld(features='command', source=source, target=target, command=argv)
+    bindgen.env['FEATURES'] = ','.join(features)
+    bindgen.dep_vars = ['FEATURES', "GCC_RTTI_ABI_COMPLETE"]
+    bindgen.name = "pybindgen(ns3 module %s)" % module
+    bindgen.install_path = None
+
+    # generate the extension module
+    pymod = bld(features='cxx cxxshlib pyext')
+    pymod.source = ['bindings/ns3module.cc']
+    pymod.target = '%s/%s' % (module_target_dir, extension_name)
+    pymod.name = 'ns3module_%s' % module
+    pymod.use = ["%s" % mod for mod in pymod.env['NS3_ENABLED_MODULES']] #  Should be '"ns3-"+module', but see bug 1117
+    if pymod.env['ENABLE_STATIC_NS3']:
+        if sys.platform == 'darwin':
+            pymod.env.append_value('LINKFLAGS', '-Wl,-all_load')
+            for mod in pymod.usel:
+                #mod = mod.split("--lib")[0]
+                pymod.env.append_value('LINKFLAGS', '-l' + mod)
+        else:
+            pymod.env.append_value('LINKFLAGS', '-Wl,--whole-archive,-Bstatic')
+            for mod in pymod.use:
+                #mod = mod.split("--lib")[0]
+                pymod.env.append_value('LINKFLAGS', '-l' + mod)
+            pymod.env.append_value('LINKFLAGS', '-Wl,-Bdynamic,--no-whole-archive')
+    defines = list(pymod.env['DEFINES'])
+    defines.extend(['NS_DEPRECATED=', 'NS3_DEPRECATED_H'])
+    if Utils.unversioned_sys_platform()== 'win32':
+        try:
+            defines.remove('_DEBUG') # causes undefined symbols on win32
+        except ValueError:
+            pass
+    pymod.env['DEFINES'] = defines
+    pymod.includes = '# bindings'
+    pymod.install_path = '${PYTHONARCHDIR}/ns'
+
+    # Workaround to a WAF bug, remove this when ns-3 upgrades to WAF > 1.6.10
+    # https://www.nsnam.org/bugzilla/show_bug.cgi?id=1335
+    # http://code.google.com/p/waf/issues/detail?id=1098
+    if Utils.unversioned_sys_platform() == 'darwin':
+        pymod.mac_bundle = True
+
+    return pymod
+
 
 def build(bld):
+    bld.create_ns3_module = types.MethodType(create_ns3_module, bld)
+    bld.create_ns3_module_test_library = types.MethodType(create_ns3_module_test_library, bld)
+    bld.create_obj = types.MethodType(create_obj, bld)
+    bld.ns3_python_bindings = types.MethodType(ns3_python_bindings, bld)
+    
+    # Remove these modules from the list of all modules.
+    for not_built in bld.env['MODULES_NOT_BUILT']:
 
-    lte_module_dependencies = ['core', 'network', 'spectrum', 'stats', 'buildings', 'virtual-net-device','point-to-point','applications','internet','csma']
-    if (bld.env['ENABLE_EMU']):
-        lte_module_dependencies.append('fd-net-device')
-    module = bld.create_ns3_module('lte', lte_module_dependencies)
-    module.source = [
-        'model/lte-common.cc',
-        'model/lte-spectrum-phy.cc',
-        'model/lte-spectrum-signal-parameters.cc',
-        'model/lte-phy.cc',
-        'model/lte-enb-phy.cc',
-        'model/lte-ue-phy.cc',
-        'model/lte-spectrum-value-helper.cc',
-        'model/lte-amc.cc',
-        'model/lte-enb-rrc.cc',
-        'model/lte-ue-rrc.cc',
-        'model/lte-rrc-sap.cc',
-        'model/lte-rrc-protocol-ideal.cc',
-        'model/lte-rrc-protocol-real.cc',
-        'model/lte-rlc-sap.cc',
-        'model/lte-rlc.cc',
-        'model/lte-rlc-sequence-number.cc',
-        'model/lte-rlc-header.cc',
-        'model/lte-rlc-am-header.cc',
-        'model/lte-rlc-tm.cc',
-        'model/lte-rlc-um.cc',
-        'model/lte-rlc-am.cc',
-        'model/lte-rlc-tag.cc',
-        'model/lte-rlc-sdu-status-tag.cc',
-        'model/lte-pdcp-sap.cc',
-        'model/lte-pdcp.cc',
-        'model/lte-pdcp-header.cc',
-        'model/lte-pdcp-tag.cc',
-        'model/eps-bearer.cc',
-        'model/lte-radio-bearer-info.cc',
-        'model/lte-net-device.cc',
-        'model/lte-enb-net-device.cc',
-        'model/lte-ue-net-device.cc',
-        'model/lte-control-messages.cc',
-        'helper/lte-helper.cc',
-        'helper/lte-stats-calculator.cc',
-        'helper/epc-helper.cc',
-        'helper/no-backhaul-epc-helper.cc',
-        'helper/point-to-point-epc-helper.cc',
-        'helper/radio-bearer-stats-calculator.cc',
-        'helper/radio-bearer-stats-connector.cc',
-        'helper/phy-stats-calculator.cc',
-        'helper/mac-stats-calculator.cc',
-        'helper/phy-tx-stats-calculator.cc',
-        'helper/phy-rx-stats-calculator.cc',
-        'helper/radio-environment-map-helper.cc',
-        'helper/lte-hex-grid-enb-topology-helper.cc',
-        'helper/lte-global-pathloss-database.cc',
-        'model/rem-spectrum-phy.cc',
-        'model/ff-mac-common.cc',
-        'model/ff-mac-csched-sap.cc',
-        'model/ff-mac-sched-sap.cc',
-        'model/lte-mac-sap.cc',
-        'model/ff-mac-scheduler.cc',
-        'model/lte-enb-cmac-sap.cc',
-        'model/lte-ue-cmac-sap.cc',
-        'model/rr-ff-mac-scheduler.cc',
-        'model/lte-enb-mac.cc',
-        'model/lte-ue-mac.cc',
-        'model/lte-radio-bearer-tag.cc',
-        'model/eps-bearer-tag.cc',
-        'model/lte-phy-tag.cc',
-        'model/lte-enb-phy-sap.cc',
-        'model/lte-enb-cphy-sap.cc',
-        'model/lte-ue-phy-sap.cc',
-        'model/lte-ue-cphy-sap.cc',
-        'model/lte-interference.cc',
-        'model/lte-chunk-processor.cc',
-        'model/pf-ff-mac-scheduler.cc',
-        'model/fdmt-ff-mac-scheduler.cc',
-        'model/tdmt-ff-mac-scheduler.cc',
-        'model/tta-ff-mac-scheduler.cc',
-        'model/fdbet-ff-mac-scheduler.cc',
-        'model/tdbet-ff-mac-scheduler.cc',
-        'model/fdtbfq-ff-mac-scheduler.cc',
-        'model/tdtbfq-ff-mac-scheduler.cc',
-        'model/pss-ff-mac-scheduler.cc',
-        'model/cqa-ff-mac-scheduler.cc',
-        'model/epc-gtpu-header.cc',
-        'model/epc-gtpc-header.cc',
-        'model/epc-enb-application.cc',
-        'model/epc-sgw-application.cc',
-        'model/epc-pgw-application.cc',
-        'model/epc-mme-application.cc',
-        'model/epc-x2-sap.cc',
-        'model/epc-x2-header.cc',
-        'model/epc-x2.cc',
-        'model/epc-tft.cc',
-        'model/epc-tft-classifier.cc',
-        'model/lte-mi-error-model.cc',
-        'model/lte-vendor-specific-parameters.cc',
-        'model/epc-enb-s1-sap.cc',
-        'model/epc-s1ap-sap.cc',
-        'model/epc-s11-sap.cc',
-        'model/lte-as-sap.cc',
-        'model/epc-ue-nas.cc',
-        'model/lte-harq-phy.cc',
-        'model/lte-asn1-header.cc',
-        'model/lte-rrc-header.cc',
-        'model/lte-handover-management-sap.cc',
-        'model/lte-handover-algorithm.cc',
-        'model/a2-a4-rsrq-handover-algorithm.cc',
-        'model/a3-rsrp-handover-algorithm.cc',
-        'model/no-op-handover-algorithm.cc',
-        'model/lte-anr-sap.cc',
-        'model/lte-anr.cc',
-        'model/lte-ffr-algorithm.cc',
-        'model/lte-ffr-sap.cc',
-        'model/lte-ffr-rrc-sap.cc',
-        'model/lte-fr-no-op-algorithm.cc',
-        'model/lte-fr-hard-algorithm.cc',
-        'model/lte-fr-strict-algorithm.cc',
-        'model/lte-fr-soft-algorithm.cc',
-        'model/lte-ffr-soft-algorithm.cc',
-        'model/lte-ffr-enhanced-algorithm.cc',
-        'model/lte-ffr-distributed-algorithm.cc',
-        'model/lte-ue-power-control.cc',
-        'model/lte-ccm-rrc-sap.cc',
-        'model/lte-ue-ccm-rrc-sap.cc', 
-        'model/lte-ccm-mac-sap.cc', 
-        'model/lte-enb-component-carrier-manager.cc',
-        'model/lte-ue-component-carrier-manager.cc',
-        'model/no-op-component-carrier-manager.cc',
-        'model/simple-ue-component-carrier-manager.cc',
-        'model/component-carrier.cc',
-        'helper/cc-helper.cc',
-        'model/component-carrier-ue.cc',
-        'model/component-carrier-enb.cc',
-        'model/cell-individual-offset.cc'
-        ]
+        # XXX Because these modules are located in subdirectories of
+        # test, their names in the all_modules list include the extra
+        # relative path "test/".  If these modules are moved into the
+        # src directory, then this if block should be removed.
+        if not_built == 'ns3tcp' or not_built == 'ns3wifi':
+            not_built = 'test/' + not_built
 
-    module_test = bld.create_ns3_module_test_library('lte')
-    module_test.source = [
-        'test/lte-test-downlink-sinr.cc',
-        'test/lte-test-uplink-sinr.cc',
-        'test/lte-test-link-adaptation.cc',
-        'test/lte-test-interference.cc',
-        'test/lte-test-ue-phy.cc',
-        'test/lte-test-rr-ff-mac-scheduler.cc',
-        'test/lte-test-pf-ff-mac-scheduler.cc',
-        'test/lte-test-fdmt-ff-mac-scheduler.cc',
-        'test/lte-test-tdmt-ff-mac-scheduler.cc',
-        'test/lte-test-tta-ff-mac-scheduler.cc',
-        'test/lte-test-fdbet-ff-mac-scheduler.cc',
-        'test/lte-test-tdbet-ff-mac-scheduler.cc',
-        'test/lte-test-fdtbfq-ff-mac-scheduler.cc',
-        'test/lte-test-tdtbfq-ff-mac-scheduler.cc',
-        'test/lte-test-pss-ff-mac-scheduler.cc',
-        'test/lte-test-cqa-ff-mac-scheduler.cc',
-        'test/lte-test-earfcn.cc',
-        'test/lte-test-spectrum-value-helper.cc',
-        'test/lte-test-pathloss-model.cc',
-        'test/lte-test-entities.cc',
-        'test/lte-simple-helper.cc',
-        'test/lte-simple-net-device.cc',
-        'test/test-lte-rlc-header.cc',
-        'test/lte-test-rlc-um-transmitter.cc',
-        'test/lte-test-rlc-am-transmitter.cc',
-        'test/lte-test-rlc-um-e2e.cc',
-        'test/lte-test-rlc-am-e2e.cc',
-        'test/epc-test-gtpu.cc',
-        'test/test-epc-tft-classifier.cc',
-        'test/epc-test-s1u-downlink.cc',
-        'test/epc-test-s1u-uplink.cc',
-        'test/test-lte-epc-e2e-data.cc',
-        'test/test-lte-antenna.cc',
-        'test/lte-test-phy-error-model.cc',
-        'test/lte-test-mimo.cc',
-        'test/lte-test-harq.cc',
-        'test/test-lte-rrc.cc',
-        'test/test-lte-x2-handover.cc',
-        'test/test-lte-x2-handover-measures.cc',
-        'test/test-asn1-encoding.cc',
-        'test/lte-test-ue-measurements.cc',
-        'test/lte-test-cell-selection.cc',
-        'test/lte-test-secondary-cell-selection.cc',
-        'test/test-lte-handover-delay.cc',
-        'test/test-lte-handover-target.cc',
-        'test/lte-test-deactivate-bearer.cc',
-        'test/lte-ffr-simple.cc',
-        'test/lte-test-downlink-power-control.cc',
-        'test/lte-test-uplink-power-control.cc',
-        'test/lte-test-frequency-reuse.cc',
-        'test/lte-test-interference-fr.cc',
-        'test/lte-test-cqi-generation.cc',
-        'test/lte-simple-spectrum-phy.cc',
-        'test/lte-test-carrier-aggregation.cc',
-        'test/lte-test-aggregation-throughput-scale.cc',
-        'test/lte-test-ipv6-routing.cc',
-        'test/lte-test-carrier-aggregation-configuration.cc',
-        'test/lte-test-radio-link-failure.cc',
-        'model/cell-individual-offset.cc'
-        ]
+        if not_built in all_modules:
+            all_modules.remove(not_built)
 
-    headers = bld(features='ns3header')
-    headers.module = 'lte'
-    headers.source = [
-        'model/lte-common.h',
-        'model/lte-spectrum-phy.h',
-        'model/lte-spectrum-signal-parameters.h',
-        'model/lte-phy.h',
-        'model/lte-enb-phy.h',
-        'model/lte-ue-phy.h',
-        'model/lte-spectrum-value-helper.h',
-        'model/lte-amc.h',
-        'model/lte-enb-rrc.h',
-        'model/lte-ue-rrc.h',
-        'model/lte-rrc-sap.h',
-        'model/lte-rrc-protocol-ideal.h',
-        'model/lte-rrc-protocol-real.h',
-        'model/lte-rlc-sap.h',
-        'model/lte-rlc.h',
-        'model/lte-rlc-header.h',
-        'model/lte-rlc-sequence-number.h',
-        'model/lte-rlc-am-header.h',
-        'model/lte-rlc-tm.h',
-        'model/lte-rlc-um.h',
-        'model/lte-rlc-am.h',
-        'model/lte-rlc-tag.h',
-        'model/lte-rlc-sdu-status-tag.h',
-        'model/lte-pdcp-sap.h',
-        'model/lte-pdcp.h',
-        'model/lte-pdcp-header.h',
-        'model/lte-pdcp-tag.h',
-        'model/eps-bearer.h',
-        'model/lte-radio-bearer-info.h',
-        'model/lte-net-device.h',
-        'model/lte-enb-net-device.h',
-        'model/lte-ue-net-device.h',
-        'model/lte-control-messages.h',
-        'helper/lte-helper.h',
-        'helper/lte-stats-calculator.h',
-        'helper/epc-helper.h',
-        'helper/no-backhaul-epc-helper.h',
-        'helper/point-to-point-epc-helper.h',
-        'helper/phy-stats-calculator.h',
-        'helper/mac-stats-calculator.h',
-        'helper/phy-tx-stats-calculator.h',
-        'helper/phy-rx-stats-calculator.h',
-        'helper/radio-bearer-stats-calculator.h',
-        'helper/radio-bearer-stats-connector.h',
-        'helper/radio-environment-map-helper.h',
-        'helper/lte-hex-grid-enb-topology-helper.h',
-        'helper/lte-global-pathloss-database.h',
-        'model/rem-spectrum-phy.h',
-        'model/ff-mac-common.h',
-        'model/ff-mac-csched-sap.h',
-        'model/ff-mac-sched-sap.h',
-        'model/lte-enb-cmac-sap.h',
-        'model/lte-ue-cmac-sap.h',
-        'model/lte-mac-sap.h',
-        'model/ff-mac-scheduler.h',
-        'model/rr-ff-mac-scheduler.h',
-        'model/lte-enb-mac.h',
-        'model/lte-ue-mac.h',
-        'model/lte-radio-bearer-tag.h',
-        'model/eps-bearer-tag.h',
-        'model/lte-phy-tag.h',
-        'model/lte-enb-phy-sap.h',
-        'model/lte-enb-cphy-sap.h',
-        'model/lte-ue-phy-sap.h',
-        'model/lte-ue-cphy-sap.h',
-        'model/lte-interference.h',
-        'model/lte-chunk-processor.h',
-        'model/pf-ff-mac-scheduler.h',
-        'model/fdmt-ff-mac-scheduler.h',
-        'model/tdmt-ff-mac-scheduler.h',
-        'model/tta-ff-mac-scheduler.h',
-        'model/fdbet-ff-mac-scheduler.h',
-        'model/tdbet-ff-mac-scheduler.h',
-        'model/fdtbfq-ff-mac-scheduler.h',
-        'model/tdtbfq-ff-mac-scheduler.h',
-        'model/pss-ff-mac-scheduler.h',
-        'model/cqa-ff-mac-scheduler.h',
-        'model/epc-gtpu-header.h',
-        'model/epc-gtpc-header.h',
-        'model/epc-enb-application.h',
-        'model/epc-sgw-application.h',
-        'model/epc-pgw-application.h',
-        'model/epc-mme-application.h',
-        'model/lte-vendor-specific-parameters.h',
-        'model/epc-x2-sap.h',
-        'model/epc-x2-header.h',
-        'model/epc-x2.h',
-        'model/epc-tft.h',
-        'model/epc-tft-classifier.h',
-        'model/lte-mi-error-model.h',
-        'model/epc-enb-s1-sap.h',
-        'model/epc-s1ap-sap.h',
-        'model/epc-s11-sap.h',
-        'model/lte-as-sap.h',
-        'model/epc-ue-nas.h',
-        'model/lte-harq-phy.h',
-        'model/lte-asn1-header.h',
-        'model/lte-rrc-header.h',
-        'model/lte-handover-management-sap.h',
-        'model/lte-handover-algorithm.h',
-        'model/a2-a4-rsrq-handover-algorithm.h',
-        'model/a3-rsrp-handover-algorithm.h',
-        'model/no-op-handover-algorithm.h',
-        'model/lte-anr-sap.h',
-        'model/lte-anr.h',
-        'model/lte-ffr-algorithm.h',
-        'model/lte-ffr-sap.h',
-        'model/lte-ffr-rrc-sap.h',
-        'model/lte-fr-no-op-algorithm.h',
-        'model/lte-fr-hard-algorithm.h',
-        'model/lte-fr-strict-algorithm.h',
-        'model/lte-fr-soft-algorithm.h',
-        'model/lte-ffr-soft-algorithm.h',
-        'model/lte-ffr-enhanced-algorithm.h',
-        'model/lte-ffr-distributed-algorithm.h',
-        'model/lte-ue-power-control.h',
-        'model/lte-ccm-rrc-sap.h',
-        'model/lte-ue-ccm-rrc-sap.h', 
-        'model/lte-ccm-mac-sap.h', 
-        'model/lte-enb-component-carrier-manager.h',
-        'model/lte-ue-component-carrier-manager.h',
-        'model/no-op-component-carrier-manager.h',
-        'model/simple-ue-component-carrier-manager.h',
-        'helper/cc-helper.h',
-        'model/component-carrier.h',
-        'model/component-carrier-ue.h',
-        'model/component-carrier-enb.h',
-        'model/cell-individual-offset.h'
-        ]
+    bld.recurse(list(all_modules))
 
-    if (bld.env['ENABLE_EMU']):
-        module.source.append ('helper/emu-epc-helper.cc')
-        headers.source.append ('helper/emu-epc-helper.h')
+    for module in all_modules:
+        modheader = bld(features='ns3moduleheader')
+        modheader.module = module.split('/')[-1]
 
-    if (bld.env['ENABLE_EXAMPLES']):
-      bld.recurse('examples')
+class ns3pcfile(Task.Task):
+    after = ['cxxprogram', 'cxxshlib', 'cxxstlib']
 
-    bld.ns3_python_bindings()
+    def __str__(self):
+        "string to display to the user"
+        tgt_str = ' '.join([a.bldpath() for a in self.outputs])
+        return 'pcfile: %s' % (tgt_str)
+
+    def runnable_status(self):
+        return super(ns3pcfile, self).runnable_status()
+
+    def _self_libs(self, env, name, libdir):
+        if env['ENABLE_STATIC_NS3']:
+            path_st = 'STLIBPATH_ST'
+            lib_st = 'STLIB_ST'
+            lib_marker = 'STLIB_MARKER'
+        else:
+            path_st = 'LIBPATH_ST'
+            lib_st = 'LIB_ST'
+            lib_marker = 'SHLIB_MARKER'
+        retval = [env[path_st] % libdir]
+        if env[lib_marker]:
+            retval.append(env[lib_marker])
+        retval.append(env[lib_st] % name)
+        return retval
+
+    def _lib(self, env, dep):
+        libpath = env['LIBPATH_%s' % dep]
+        linkflags = env['LINKFLAGS_%s' % dep]
+        libs = env['LIB_%s' % dep]
+        retval = []
+        for path in libpath:
+            retval.append(env['LIBPATH_ST'] % path)
+            retval = retval + linkflags
+        for lib in libs:
+            retval.append(env['LIB_ST'] % lib)
+        return retval
+
+    def _listify(self, v):
+        if isinstance(v, list):
+            return v
+        else:
+            return [v]
+
+    def _cflags(self, dep):
+        flags = self.env['CFLAGS_%s' % dep]
+        return self._listify(flags)
+
+    def _cxxflags(self, dep):
+        return self._listify(self.env['CXXFLAGS_%s' % dep])
+
+    def _defines(self, dep):
+        return [self.env['DEFINES_ST'] % define for define in self.env['DEFINES_%s' % dep]] 
+
+    def _includes(self, dep):
+        includes = self.env['INCLUDES_%s' % dep]
+        return [self.env['CPPPATH_ST'] % include for include in Utils.to_list(includes)]
+
+    def _generate_pcfile(self, name, use, env, outfilename, module):
+        outfile = open(outfilename, 'wt')
+        prefix = env.PREFIX
+        includedir = Utils.subst_vars('${INCLUDEDIR}/%s%s' % (wutils.APPNAME, wutils.VERSION), env)
+        libdir = env.LIBDIR
+        libs = self._self_libs(env, "%s%s-%s%s" % (wutils.APPNAME, wutils.VERSION, name[4:], env.BUILD_SUFFIX), '${libdir}')
+        for dep in use:
+            libs += self._lib(env, dep)
+        for dep in env.LIBS:
+            libs += self.env['LIB_ST'] % dep
+        cflags = [self.env['CPPPATH_ST'] % '${includedir}']
+
+        if getattr(module, 'export_includes', None):
+            for include in module.to_incnodes(module.export_includes):
+                cflags += [self.env['CPPPATH_ST'] % include.abspath()]
+        requires = []
+        for dep in use:
+            cflags = cflags + self._cflags(dep) + self._cxxflags(dep) + \
+                self._defines(dep) + self._includes(dep)
+            if dep.startswith('ns3-'):
+                dep_name = dep[4:]
+                requires.append("libns%s-%s%s" % (wutils.VERSION, dep_name, env.BUILD_SUFFIX))
+        print("""\
+prefix=%s
+libdir=%s
+includedir=%s
+
+Name: lib%s
+Description: ns-3 module %s
+Version: %s
+Libs: %s
+Cflags: %s
+Requires: %s\
+""" % (prefix, libdir, includedir,
+       name, name, wutils.VERSION, ' '.join(libs), ' '.join(cflags), ' '.join(requires)), file=outfile)
+        outfile.close()
+
+    def run(self):
+        output_filename = self.outputs[0].abspath()
+        self._generate_pcfile(self.module.name, 
+                              self.module.to_list(self.module.use),
+                              self.env, output_filename, self.module)
+
+
+@TaskGen.feature('ns3pcfile')
+@TaskGen.after_method('process_rule')
+def apply(self):
+    module = self.bld.find_ns3_module(self.module)
+    output_filename = 'lib%s.pc' % os.path.basename(module.target)
+    output_node = self.path.find_or_declare(output_filename)
+    assert output_node is not None, str(self)
+    task = self.create_task('ns3pcfile')
+    self.bld.install_files('${LIBDIR}/pkgconfig', output_node)
+    task.set_outputs([output_node])
+    task.module = module
+
+
+
+@TaskGen.feature('ns3header')
+@TaskGen.after_method('process_rule')
+def apply_ns3header(self):
+    if self.module is None:
+        raise WafError("'module' missing on ns3headers object %s" % self)
+    ns3_dir_node = self.bld.path.find_or_declare("ns3")
+    for filename in set(self.to_list(self.source)):
+        src_node = self.path.find_resource(filename)
+        if src_node is None:
+            raise WafError("source ns3 header file %s not found" % (filename,))
+        dst_node = ns3_dir_node.find_or_declare(src_node.name)
+        assert dst_node is not None
+        task = self.create_task('ns3header')
+        task.mode = getattr(self, 'mode', 'install')
+        if task.mode == 'install':
+            self.bld.install_files('${INCLUDEDIR}/%s%s/ns3' % (wutils.APPNAME, wutils.VERSION), [src_node])
+            task.set_inputs([src_node])
+            task.set_outputs([dst_node])
+        else:
+            task.header_to_remove = dst_node
+    self.headers = set(self.to_list(self.source))
+    self.source = '' # tell WAF not to process these files further
+
+
+class ns3header(Task.Task):
+    before = ['cxxprogram', 'cxxshlib', 'cxxstlib', 'gen_ns3_module_header']
+    color = 'BLUE'
+
+    def __str__(self):
+        "string to display to the user"
+        env = self.env
+        src_str = ' '.join([a.bldpath() for a in self.inputs])
+        tgt_str = ' '.join([a.bldpath() for a in self.outputs])
+        if self.outputs: sep = ' -> '
+        else: sep = ''
+        if self.mode == 'remove':
+            return 'rm-ns3-header %s' % (self.header_to_remove.abspath(),)
+        return 'install-ns3-header: %s' % (tgt_str)
+
+    def __repr__(self):
+        return str(self)
+
+    def uid(self):
+        try:
+            return self.uid_
+        except AttributeError:
+            m = Utils.md5()
+            up = m.update
+            up(self.__class__.__name__.encode())
+            for x in self.inputs + self.outputs:
+                up(x.abspath().encode())
+            up(self.mode.encode())
+            if self.mode == 'remove':
+                up(self.header_to_remove.abspath().encode())
+            self.uid_ = m.digest()
+            return self.uid_
+
+    def runnable_status(self):
+        if self.mode == 'remove':
+            if os.path.exists(self.header_to_remove.abspath()):
+                return Task.RUN_ME
+            else:
+                return Task.SKIP_ME
+        else:
+            return super(ns3header, self).runnable_status()
+
+    def run(self):
+        if self.mode == 'install':
+            assert len(self.inputs) == len(self.outputs)
+            inputs = [node.abspath() for node in self.inputs]
+            outputs = [node.abspath() for node in self.outputs]
+            for src, dst in zip(inputs, outputs):
+                try:
+                    os.chmod(dst, 0o600)
+                except OSError:
+                    pass
+                shutil.copy2(src, dst)
+                ## make the headers in builddir read-only, to prevent
+                ## accidental modification
+                os.chmod(dst, 0o400)
+            return 0
+        else:
+            assert len(self.inputs) == 0
+            assert len(self.outputs) == 0
+            out_file_name = self.header_to_remove.abspath()
+            try:
+                os.unlink(out_file_name)
+            except OSError as ex:
+                if ex.errno != 2:
+                    raise
+            return 0
+
+
+@TaskGen.feature('ns3privateheader')
+@TaskGen.after_method('process_rule')
+def apply_ns3privateheader(self):
+    if self.module is None:
+        raise WafError("'module' missing on ns3headers object %s" % self)
+    ns3_dir_node = self.bld.path.find_or_declare("ns3/private")
+    for filename in set(self.to_list(self.source)):
+        src_node = self.path.find_resource(filename)
+        if src_node is None:
+            raise WafError("source ns3 header file %s not found" % (filename,))
+        dst_node = ns3_dir_node.find_or_declare(src_node.name)
+        assert dst_node is not None
+        task = self.create_task('ns3privateheader')
+        task.mode = getattr(self, 'mode', 'install')
+        if task.mode == 'install':
+            task.set_inputs([src_node])
+            task.set_outputs([dst_node])
+        else:
+            task.header_to_remove = dst_node
+    self.headers = set(self.to_list(self.source))
+    self.source = '' # tell WAF not to process these files further
+
+class ns3privateheader(Task.Task):
+    before = ['cxxprogram', 'cxxshlib', 'cxxstlib', 'gen_ns3_module_header']
+    after = 'ns3header'
+    color = 'BLUE'
+
+    def __str__(self):
+        "string to display to the user"
+        env = self.env
+        src_str = ' '.join([a.bldpath() for a in self.inputs])
+        tgt_str = ' '.join([a.bldpath() for a in self.outputs])
+        if self.outputs: sep = ' -> '
+        else: sep = ''
+        if self.mode == 'remove':
+            return 'rm-ns3-header %s' % (self.header_to_remove.abspath(),)
+        return 'install-ns3-header: %s' % (tgt_str)
+
+    def __repr__(self):
+        return str(self)
+
+    def uid(self):
+        try:
+            return self.uid_
+        except AttributeError:
+            m = Utils.md5()
+            up = m.update
+            up(self.__class__.__name__.encode())
+            for x in self.inputs + self.outputs:
+                up(x.abspath().encode())
+            up(self.mode.encode())
+            if self.mode == 'remove':
+                up(self.header_to_remove.abspath().encode())
+            self.uid_ = m.digest()
+            return self.uid_
+
+    def runnable_status(self):
+        if self.mode == 'remove':
+            if os.path.exists(self.header_to_remove.abspath()):
+                return Task.RUN_ME
+            else:
+                return Task.SKIP_ME
+        else:
+            return super(ns3privateheader, self).runnable_status()
+
+    def run(self):
+        if self.mode == 'install':
+            assert len(self.inputs) == len(self.outputs)
+            inputs = [node.abspath() for node in self.inputs]
+            outputs = [node.abspath() for node in self.outputs]
+            for src, dst in zip(inputs, outputs):
+                try:
+                    os.chmod(dst, 0o600)
+                except OSError:
+                    pass
+                shutil.copy2(src, dst)
+                ## make the headers in builddir read-only, to prevent
+                ## accidental modification
+                os.chmod(dst, 0o400)
+            return 0
+        else:
+            assert len(self.inputs) == 0
+            assert len(self.outputs) == 0
+            out_file_name = self.header_to_remove.abspath()
+            try:
+                os.unlink(out_file_name)
+            except OSError as ex:
+                if ex.errno != 2:
+                    raise
+            return 0
+
+
+class gen_ns3_module_header(Task.Task):
+    before = ['cxxprogram', 'cxxshlib', 'cxxstlib']
+    after = 'ns3header'
+    color = 'BLUE'
+
+    def runnable_status(self):
+        if self.mode == 'remove':
+            if os.path.exists(self.header_to_remove.abspath()):
+                return Task.RUN_ME
+            else:
+                return Task.SKIP_ME
+        else:
+            return super(gen_ns3_module_header, self).runnable_status()
+
+    def __str__(self):
+        "string to display to the user"
+        env = self.env
+        src_str = ' '.join([a.bldpath() for a in self.inputs])
+        tgt_str = ' '.join([a.bldpath() for a in self.outputs])
+        if self.outputs: sep = ' -> '
+        else: sep = ''
+        if self.mode == 'remove':
+            return 'rm-module-header %s' % (self.header_to_remove.abspath(),)
+        return 'gen-module-header: %s' % (tgt_str)
+
+    def run(self):
+        if self.mode == 'remove':
+            assert len(self.inputs) == 0
+            assert len(self.outputs) == 0
+            out_file_name = self.header_to_remove.abspath()
+            try:
+                os.unlink(out_file_name)
+            except OSError as ex:
+                if ex.errno != 2:
+                    raise
+            return 0
+        assert len(self.outputs) == 1
+        out_file_name = self.outputs[0].get_bld().abspath()#self.env)
+        header_files = [os.path.basename(node.abspath()) for node in self.inputs]
+        outfile = open(out_file_name, "w")
+        header_files.sort()
+
+        print("""
+#ifdef NS3_MODULE_COMPILATION
+# error "Do not include ns3 module aggregator headers from other modules; these are meant only for end user scripts."
+#endif
+
+#ifndef NS3_MODULE_%s
+    """ % (self.module.upper().replace('-', '_'),), file=outfile)
+
+    #     if self.module_deps:
+    #         print >> outfile, "// Module dependencies:"
+    #     for dep in self.module_deps:
+    #         print >> outfile, "#include \"%s-module.h\"" % dep
+
+        print(file=outfile)
+        print("// Module headers:", file=outfile)
+        for header in header_files:
+            print("#include \"%s\"" % (header,), file=outfile)
+
+        print("#endif", file=outfile)
+
+        outfile.close()
+        return 0
+
+    def sig_explicit_deps(self):
+        self.m.update('\n'.join(sorted([node.abspath() for node in self.inputs])).encode('utf-8'))
+        return self.m.digest()
+
+    def unique_id(self):
+        try:
+            return self.uid
+        except AttributeError:
+            "this is not a real hot zone, but we want to avoid surprizes here"
+            m = Utils.md5()
+            m.update("ns-3-module-header-%s" % self.module)
+            self.uid = m.digest()
+            return self.uid
+
+
+# Generates a 'ns3/foo-module.h' header file that includes all public
+# ns3 headers of a certain module.
+@TaskGen.feature('ns3moduleheader')
+@TaskGen.after_method('process_rule')
+def apply_ns3moduleheader(self):
+    ## get all of the ns3 headers
+    ns3_dir_node = self.bld.path.find_or_declare("ns3")
+    all_headers_inputs = []
+    found_the_module = False
+    for ns3headers in self.bld.all_task_gen:
+        if 'ns3header' in getattr(ns3headers, "features", []):
+            if ns3headers.module != self.module:
+                continue
+            found_the_module = True
+            for source in sorted(ns3headers.headers):
+                source = os.path.basename(source)
+                node = ns3_dir_node.find_or_declare(os.path.basename(source))
+                if node is None:
+                    fatal("missing header file %s" % (source,))
+                all_headers_inputs.append(node)
+    if not found_the_module:
+        raise WafError("error finding headers for module %s" % self.module)
+    if not all_headers_inputs:
+        return
+
+    try:
+        module_obj = self.bld.get_tgen_by_name("ns3-" + self.module)
+    except WafError: # maybe the module was disabled, and therefore removed
+        return
+
+    all_headers_outputs = [ns3_dir_node.find_or_declare("%s-module.h" % self.module)]
+    task = self.create_task('gen_ns3_module_header')
+    task.module = self.module
+    task.mode = getattr(self, "mode", "install")
+    if task.mode == 'install':
+        assert module_obj is not None, self.module
+        self.bld.install_files('${INCLUDEDIR}/%s%s/ns3' % (wutils.APPNAME, wutils.VERSION),
+                               ns3_dir_node.find_or_declare("%s-module.h" % self.module))
+        task.set_inputs(all_headers_inputs)
+        task.set_outputs(all_headers_outputs)
+        task.module_deps = module_obj.module_deps
+    else:
+        task.header_to_remove = all_headers_outputs[0]
